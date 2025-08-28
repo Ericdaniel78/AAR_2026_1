@@ -1,0 +1,162 @@
+---
+title: "Práctica 1 – Simulación de cartera de Autos"
+author: "Equipo de trabajo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Carga de paquetes necesarios
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+set.seed(2025) # Fijamos semilla para reproducibilidad
+```
+
+## Objetivo de la simulación
+
+En esta práctica construiremos un **dataset sintético** que represente la cartera de pólizas de una aseguradora de autos.  
+Para ello asumimos tres coberturas principales:
+
+1. **Daños Materiales (DM)**
+2. **Robo Total (Robo)**
+3. **Responsabilidad Civil (RC)**
+
+Los parámetros de frecuencia y severidad se basan en supuestos ficticios inspirados en el ejemplo de SESA.  
+Las frecuencias se ajustan por segmento, y las severidades provienen de distribuciones lognormales que reproducen medias de siniestro razonables para el ramo.
+
+## Definición de supuestos
+
+Primero definimos los supuestos base y los segmentos de riesgo.  
+Los segmentos permiten diferenciar clientes según su perfil (por ejemplo, tipo de vehículo o zona geográfica).  
+Para cada segmento se asigna un multiplicador que ajusta la frecuencia base.
+
+```{r parametros}
+## Número de pólizas a simular
+n_polizas <- 10000
+
+## Coberturas y frecuencias base (probabilidad de al menos un siniestro por póliza en un año)
+freq_base <- c(DM = 0.05, Robo = 0.04, RC = 0.06)
+
+## Severidades medias (en pesos mexicanos)
+sev_media <- c(DM = 21000, Robo = 15000, RC = 24000)
+
+## Supuestos lognormales: establecemos una desviación logarítmica
+# Una desviación moderada genera colas pesadas; ajusta si fuera necesario
+sigma_ln <- 0.6
+mu_ln <- log(sev_media) - 0.5 * sigma_ln^2
+
+## Segmentos con multiplicadores de frecuencia
+segmentos <- data.frame(
+  segmento = c("Bajo riesgo", "Estándar", "Alto riesgo"),
+  prob_segmento = c(0.3, 0.5, 0.2),
+  mult_freq = c(0.7, 1.0, 1.5)
+)
+
+segmentos
+```
+
+## Generación de la cartera simulada
+
+Simularemos cada póliza asignando aleatoriamente un segmento según las probabilidades definidas.  
+Para cada cobertura calculamos el número de siniestros mediante una distribución de Poisson con parámetro \\(\lambda = \text{frecuencia base} \times \text{multiplicador}\)).  
+Luego, si el número de siniestros es mayor que cero, generamos los montos de siniestro utilizando la distribución lognormal correspondiente.  
+La severidad total por póliza y cobertura será la suma de estos montos.
+
+```{r simulacion}
+# Asignar segmento a cada póliza
+polizas <- tibble(
+  id_poliza = 1:n_polizas,
+  segmento = sample(segmentos$segmento, size = n_polizas, replace = TRUE, prob = segmentos$prob_segmento)
+) %>%
+  left_join(segmentos, by = "segmento")
+
+# Función para simular siniestros y severidades por cobertura
+simular_cobertura <- function(freq_base, mult_freq, mu, sigma) {
+  lambda <- freq_base * mult_freq
+  n_siniestros <- rpois(n_polizas, lambda)
+  # Generar montos de siniestros (vector de longitudes variables)
+  severidades <- sapply(n_siniestros, function(n) {
+    if (n == 0) return(0)
+    sum(rlnorm(n, meanlog = mu, sdlog = sigma))
+  })
+  tibble(n_siniestros = n_siniestros, siniestro_total = severidades)
+}
+
+# Simular para cada cobertura
+sim_DM   <- simular_cobertura(freq_base["DM"],   polizas$mult_freq, mu_ln["DM"],   sigma_ln)
+sim_Robo <- simular_cobertura(freq_base["Robo"], polizas$mult_freq, mu_ln["Robo"], sigma_ln)
+sim_RC   <- simular_cobertura(freq_base["RC"],   polizas$mult_freq, mu_ln["RC"],   sigma_ln)
+
+# Consolidar datos
+cartera <- polizas %>%
+  bind_cols(
+    sim_DM   %>% rename(n_siniestros_DM   = n_siniestros, siniestro_DM   = siniestro_total),
+    sim_Robo %>% rename(n_siniestros_Robo = n_siniestros, siniestro_Robo = siniestro_total),
+    sim_RC   %>% rename(n_siniestros_RC   = n_siniestros, siniestro_RC   = siniestro_total)
+  ) %>%
+  mutate(
+    siniestro_total = siniestro_DM + siniestro_Robo + siniestro_RC
+  )
+
+# Mostrar las primeras filas
+head(cartera)
+```
+
+## Cálculo de primas y razón de siniestralidad
+
+Para cada cobertura calculamos la **prima pura** como \(\text{frecuencia} \times \text{severidad media}\) y añadimos un margen para gastos y utilidad.  
+A modo de ejemplo, consideramos un recargo del 30 %.
+
+```{r primas}
+## Prima pura por cobertura (a nivel de segmento) usando los parámetros definidos
+prima_pura <- with(cartera, tibble(
+  segmento,
+  prima_DM_pura   = freq_base["DM"]   * mult_freq * sev_media["DM"],
+  prima_Robo_pura = freq_base["Robo"] * mult_freq * sev_media["Robo"],
+  prima_RC_pura   = freq_base["RC"]   * mult_freq * sev_media["RC"]
+))
+
+## Aplicamos margen del 30 %
+margin <- 0.3
+prima_comercial <- prima_pura %>%
+  mutate(across(starts_with("prima"), ~ . * (1 + margin))) %>%
+  rename_with(~ gsub("_pura", "_comercial", .x), starts_with("prima"))
+
+## Asociamos primas al dataset
+cartera <- cartera %>% bind_cols(prima_comercial %>% select(-segmento)) %>%
+  mutate(
+    prima_total = prima_DM_comercial + prima_Robo_comercial + prima_RC_comercial
+  )
+
+## Razón de siniestralidad observada
+cartera <- cartera %>%
+  mutate(LR = ifelse(prima_total > 0, siniestro_total / prima_total, NA_real_))
+
+## Resumen agregado por segmento
+resumen_segmento <- cartera %>%
+  group_by(segmento) %>%
+  summarise(
+    polizas = n(),
+    siniestros = sum(n_siniestros_DM + n_siniestros_Robo + n_siniestros_RC),
+    siniestro_total = sum(siniestro_total),
+    prima_total = sum(prima_total),
+    LR_promedio = siniestro_total / prima_total
+  )
+
+resumen_segmento
+```
+
+## Exportación del dataset
+
+Finalmente, exportamos el dataset generado a un archivo `CSV` para entregarlo como parte del reporte.
+
+```{r export, eval=TRUE, echo=TRUE}
+write.csv(cartera, "cartera_autos_simulada_R.csv", row.names = FALSE)
+```
+
+## Conclusiones
+
+Este ejercicio permite comprender el vínculo entre la información agregada de SESA y la estimación de frecuencias y severidades individuales.  
+Al ajustar los supuestos de frecuencia, severidad y gastos, podemos reproducir un nivel de siniestralidad cercano al observado y explorar diferentes escenarios de cartera.  
+Recuerde documentar los valores de referencia, el periodo del cuadro de SESA utilizado y cualquier justificación para los supuestos adoptados.
